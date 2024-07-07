@@ -15,6 +15,7 @@ import unittest
 import logging
 import argparse
 
+from openai import AsyncOpenAI
 from typing import List
 from pydub import AudioSegment
 from PIL import Image
@@ -62,8 +63,26 @@ character_card = {}
 text_api = {}
 image_api = {}
 
+vision_api = 'openai' #or 'llava'
+
 status_last_update = None
 last_message_sent = datetime.datetime.now()
+
+HISTORY_MAX_MESSAGES = 30
+
+# per channel reset history counter
+# when convo history reset command is triggered, we set the counter to 0 for this channel
+# this means bot will fetch $counter messages from channel history on next invocation
+# increasing the counter by one
+# all the way up to HISTORY_MAX_MESSAGES
+# this also works this way for DMs (guild=None, then key will be user name)
+# key: guild (or user name)
+# value: counter (int)
+# XXX: this has a bug in that the proper way would be to store the message ID that triggered
+# the conversation history reset, and then fetch all lines after that message, but not before
+# but its no biggie, it can stay like this for now, it will just take longer to restore the 
+# full HISTORY_MAX_MESSAGES count
+reset_history_counter = {}
 
 # Unit tests
 class TestSplitDialogue(unittest.TestCase):
@@ -118,6 +137,7 @@ async def convert_webp_bytes_to_png(image_bytes):
 async def handle_image(message):
     # Mark the message as read (we know we're working on it)
     await message.add_reaction('✨')
+    global text_api
     try:
         # Process each attachment (actually just one for now)
         for attachment in message.attachments:
@@ -133,39 +153,71 @@ async def handle_image(message):
                 # Convert the image to base64
                 base64_image = encode_image_to_base64(image_bytes)
                 
-                # Define the POST data
-                post_data = {
-                    'prompt': "USER: Describe what you see and recognize in this image: [img-1] \nASSISTANT: ",
-                    'n_predict': 256,
-                    'image_data': [{"data": base64_image, "id": 1}],
-                    'ignore_eos': False,
-                    'temperature': 0.1
-                }
-                
-                # Encode the data as JSON
-                json_data = json.dumps(post_data)
-                
-                # Set the request headers
-                headers = {
-                    'Content-Type': 'application/json',
-                }
-                
-                # Specify the URL
-                llava_url = "http://localhost:8007/completion"
-                
-                # Perform the HTTP POST request for image analysis
-                async with ClientSession() as session:
-                    async with session.post(llava_url, headers=headers, data=json_data) as response:
-                        if response.status == 200:
-                            response_data = await response.json()
-                            image_description = response_data['content']
-                            
-                            # Send the response back to the Discord channel
-                            #await message.channel.send(image_description, reference=message)
+
+                if vision_api == 'llava':
+                    # Define the POST data
+                    post_data = {
+                        'prompt': "USER: Describe what you see and recognize in this image: [img-1] \nASSISTANT: ",
+                        'n_predict': 256,
+                        'image_data': [{"data": base64_image, "id": 1}],
+                        'ignore_eos': False,
+                        'temperature': 0.1
+                    }
+                    
+                    # Encode the data as JSON
+                    json_data = json.dumps(post_data)
+                    
+                    # Set the request headers
+                    headers = {
+                        'Content-Type': 'application/json',
+                    }
+                    
+                    # Specify the URL
+                    llava_url = "http://localhost:8007/completion"
+                    
+                    # Perform the HTTP POST request for image analysis
+                    async with ClientSession() as session:
+                        async with session.post(llava_url, headers=headers, data=json_data) as response:
+                            if response.status == 200:
+                                response_data = await response.json()
+                                image_description = response_data['content']
+                                
+                                # Send the response back to the Discord channel
+                                #await message.channel.send(image_description, reference=message)
+                                return image_description
+                            else:
+                                # Handle unexpected status code
+                                errorstr = f"Error: The server responded with an unexpected status code: {response.status}"
+                                await functions.write_to_log(errorstr)
+                                return None
+                else:
+                    # Vision is OpenAI API (also openrouter)
+                    async with httpx.AsyncClient() as http_client: 
+                        or_client = AsyncOpenAI(
+                            base_url="https://openrouter.ai/api/v1",
+                            api_key=text_api['headers']['Authorization'].split()[1],
+                            http_client=http_client
+                        )
+
+                        try:
+                            completion = await or_client.chat.completions.create(
+                                extra_headers={
+                                },
+                                model="fireworks/firellava-13b",
+                                messages=[
+                                    {
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "text", "text": "Describe what you see and recognize in this image. It is of utmost importance that you describe everything precisely and exactly as you see it with on sugarcoating."},
+                                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                                        ],
+                                    },
+                                ],
+                            )
+                            image_description = completion.choices[0].message.content
                             return image_description
-                        else:
-                            # Handle unexpected status code
-                            errorstr = f"Error: The server responded with an unexpected status code: {response.status}"
+                        except Exception as e:
+                            errorstr = f"Error in OpenAI API call: {str(e)}"
                             await functions.write_to_log(errorstr)
                             return None
 
@@ -240,7 +292,6 @@ async def bot_behavior(message):
                     return True
 
 
-
     # If the bot is mentioned in a message and message has attachment, reply to the message parsing the attachment
     if client.user.mentioned_in(message) and message.attachments:
         img_description = await handle_image(message)  # Function to handle image processing
@@ -308,7 +359,20 @@ async def bot_answer(message, image_description=None):
         prompt = await functions.create_image_prompt(user_input, character, text_api)
     else:
         reply = await get_reply(message)
-        history = await functions.get_conversation_history(user, 15)
+        # check our overrides for max messages to fetch
+        past_messages_to_fetch = HISTORY_MAX_MESSAGES
+        key = ""
+        if message.guild:
+            key = str(message.guild.id)  + '-' + str(message.channel.id)
+        else:
+            key = message.author.display_name
+        if key in reset_history_counter:
+            past_messages_to_fetch = reset_history_counter[key]
+            # increase by one
+            if past_messages_to_fetch < HISTORY_MAX_MESSAGES:
+                reset_history_counter[key] = past_messages_to_fetch + 1
+        history = await functions.get_conversation_history(message, user, past_messages_to_fetch)
+        history = history.replace("AvaTheAGI", "Ava")
         prompt = await functions.create_text_prompt(user_input, user, character, character_card['name'], history, reply, text_api, image_description)
 
     queue_item = {
@@ -663,7 +727,9 @@ async def on_ready():
     global character_card
     global tts_config, tts_model, gpt_cond_latent, speaker_embedding
 
-    logging.basicConfig(level=logging.DEBUG)
+    #logging.basicConfig(level=logging.DEBUG)
+
+    character_card = await functions.get_character_card("default.json")
 
     # Load TTS model
     if 'Xtts' in globals():
@@ -684,13 +750,8 @@ async def on_ready():
     if text_api["name"] != "openai":
         api_check = await functions.api_status_check(text_api["address"] + text_api["model"], headers=text_api["headers"])
 
-    character_card = await functions.get_character_card("default.json")
     
     #AsynchIO Tasks
-    asyncio.create_task(send_to_model_queue())
-    asyncio.create_task(send_to_stable_diffusion_queue())
-    asyncio.create_task(send_to_user_queue())
-    
     # Sync current slash commands (commented out unless we have new commands)
     client.tree.add_command(personality)
     client.tree.add_command(history)
@@ -743,6 +804,15 @@ history = app_commands.Group(name="conversation-history", description="View or c
 
 @history.command(name="reset", description="Reset your conversation history with the bot.")
 async def reset_history(interaction):
+    # check our history reset counter
+    key = ""
+    if interaction.guild:
+        key = str(interaction.guild.id)  + '-' + str(interaction.channel_id)
+    else:
+        key = interaction.user.display_name
+    # reset history counter - this means bot will fetch 0 history messages next time, and it will increment on each receive
+    reset_history_counter[key] = 0
+
     user = str(interaction.user.display_name)
     user = user.replace(" ", "")
     user = functions.clean_username(user)
@@ -891,5 +961,25 @@ if not disable_tts_global:
 else:
     print("Running without XTTS - no speech audio will be generated")
 
-client.run(discord_api_key)
+#client.run(discord_api_key)
 #unittest.main()
+
+async def main():
+    # Start processing queues in the background
+    tasks = [
+        asyncio.create_task(send_to_model_queue()),
+        asyncio.create_task(send_to_stable_diffusion_queue()),
+        asyncio.create_task(send_to_user_queue())
+    ]
+
+    # Run the bot
+    #logging.getLogger("discord").setLevel(logging.WARNING)
+    await client.start(discord_api_key)
+
+    # Await the tasks to keep the event loop running
+    await asyncio.gather(*tasks)
+
+if __name__ == "__main__":
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
+

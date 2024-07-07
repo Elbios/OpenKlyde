@@ -112,11 +112,12 @@ async def create_prompt_for_random_message(character, bot, text_api):
 
 async def create_text_prompt(user_input, user, character, bot, history, reply, text_api, image_description=None):
 
+    hint = "You are currently replying to " + user + ".\n" + "Conversation history is below:\n"
     if image_description:
-        image_prompt = "[NOTE TO AI - USER MESSAGE CONTAINS AN IMAGE. IMAGE RECOGNITION HAS BEEN RUN ON THE IMAGE. DESCRIPTION OF THE IMAGE: " + image_description.capitalize() + "]"
-        prompt = character + history + reply + user + ": " + user_input + "\n" + image_prompt + "\n" + bot + ": "
+        image_prompt = "[NOTE TO AI - USER MESSAGE CONTAINS AN IMAGE. IMAGE RECOGNITION HAS BEEN RUN ON THE IMAGE. PLEASE REFER TO THE IMAGE IN YOUR RESPONSE. DESCRIPTION OF THE IMAGE: " + image_description.capitalize() + "]"
+        prompt = character + hint + history + reply + user + ": " + user_input + "\n" + image_prompt + "\n" + bot + ": "
     else:
-        prompt = character + history + reply + user + ": " + user_input + "\n" + bot + ": "
+        prompt = character + hint + history + reply + user + ": " + user_input + "\n" + bot + ": "
     stopping_strings = ["\n" + user + ":", user + ":", bot + ":", "You:", "@Ava", "User", "@" + user, "<|endoftext|>"]
     
     data = text_api["parameters"]
@@ -177,21 +178,34 @@ def clean_username(username):
     return cleaned_username
 
 # Get user's conversation history
-async def get_conversation_history(user, lines):
 
-    user = clean_username(user)
-    file = get_file_name("context", user + ".txt")
+async def get_conversation_history(message, user, lines):
+    messages = []
+    async for msg in message.channel.history(limit=lines):
+        messages.append(msg)
     
-    # Get as many lines from the file as needed
-    contents, length = await get_txt_file(file, lines)
-    
-    if contents is None:
-        contents = ""
-        
-    if length > 50:
-        await prune_text_file(file, 30)
-        
-    return contents
+    # Reverse the list to get messages in chronological order
+    messages.reverse()
+
+    # Create a string with the conversation history
+    conversation_history = "\n".join([f"{msg.author.name}: {msg.content}" for msg in messages])
+    return conversation_history
+#old implementation that only got convo history with this one user, not whole channel
+#async def get_conversation_history(user, lines):
+#
+#    user = clean_username(user)
+#    file = get_file_name("context", user + ".txt")
+#    
+#    # Get as many lines from the file as needed
+#    contents, length = await get_txt_file(file, lines)
+#    
+#    if contents is None:
+#        contents = ""
+#        
+#    if length > 50:
+#        await prune_text_file(file, 30)
+#        
+#    return contents
 
 async def add_to_conversation_history(message, user, file):
 
@@ -277,6 +291,9 @@ def truncate_from_newline_parenthesis(text):
     else:
         return text
 
+def fix_semicolon_gemma_thing(text):
+    return text.replace(": ","")
+
 async def clean_llm_reply(message, user, bot):
 
     # Clean the text and prepare it for posting
@@ -285,6 +302,7 @@ async def clean_llm_reply(message, user, bot):
     clean_message = clean_message.strip()
     
     clean_message = truncate_from_newline_parenthesis(clean_message)
+    clean_message = fix_semicolon_gemma_thing(clean_message)
     parts = clean_message.split("#", 1)
     parts2 = parts[0].split("User1", 1) # Mistral-medium hallucination
     parts3 = parts2[0].split("@", 1) # Mistral-medium hallucination
